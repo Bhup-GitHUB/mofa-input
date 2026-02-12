@@ -4,29 +4,22 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <iostream>
 
 struct LlmContext {
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
-    llama_vocab* vocab = nullptr;
     std::vector<llama_chat_message> chat_history;
-    std::vector<char> chat_buffer;
 
     ~LlmContext() {
         if (ctx) llama_free(ctx);
-        if (model) llama_model_free(model);
+        if (model) llama_free_model(model);
     }
 };
 
 // Helper: sample token
-static llama_token sample_token(llama_context* ctx, llama_vocab* vocab, float temperature) {
-    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(12345));
-
-    llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
-    llama_sampler_free(smpl);
-    return new_token_id;
+static llama_token sample_token(llama_context* ctx, llama_sampler* smpl) {
+    return llama_sampler_sample(smpl, ctx, -1);
 }
 
 extern "C" {
@@ -40,13 +33,12 @@ LlmContext* llm_init(const char* model_path) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 100;  // Offload all to GPU
 
-    llm->model = llama_model_load_from_file(model_path, model_params);
+    llm->model = llama_load_model_from_file(model_path, model_params);
     if (!llm->model) {
+        std::cerr << "Failed to load model from: " << model_path << std::endl;
         delete llm;
         return nullptr;
     }
-
-    llm->vocab = llama_model_get_vocab(llm->model);
 
     // Context params
     llama_context_params ctx_params = llama_context_default_params();
@@ -54,8 +46,9 @@ LlmContext* llm_init(const char* model_path) {
     ctx_params.n_batch = 2048;
     ctx_params.n_threads = std::thread::hardware_concurrency() / 2;
 
-    llm->ctx = llama_init_from_model(llm->model, ctx_params);
+    llm->ctx = llama_new_context_with_model(llm->model, ctx_params);
     if (!llm->ctx) {
+        std::cerr << "Failed to create context" << std::endl;
         delete llm;
         return nullptr;
     }
@@ -69,13 +62,13 @@ void llm_free(LlmContext* llm) {
 
 void llm_kv_clear(LlmContext* llm) {
     if (llm && llm->ctx) {
-        llama_kv_self_clear(llm->ctx);
+        llama_kv_cache_clear(llm->ctx);
     }
 }
 
 int llm_kv_count(LlmContext* llm) {
     if (llm && llm->ctx) {
-        return llama_kv_self_n_tokens(llm->ctx);
+        return llama_get_kv_cache_token_count(llm->ctx);
     }
     return 0;
 }
@@ -89,14 +82,23 @@ void llm_chat_add_user(LlmContext* llm, const char* message) {
     llm->chat_history.push_back({"user", strdup(message)});
 }
 
-static char* generate_response(LlmContext* llm, int max_tokens, float temperature,
+static void add_to_batch(llama_batch& batch, llama_token token, llama_pos pos, bool logits) {
+    batch.token[batch.n_tokens] = token;
+    batch.pos[batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = 1;
+    batch.seq_id[batch.n_tokens][0] = 0;
+    batch.logits[batch.n_tokens] = logits ? 1 : 0;
+    batch.n_tokens++;
+}
+
+static char* generate_response(LlmContext* llm, int32_t max_tokens, float temperature,
                                 TokenCallback callback, void* user_data) {
     std::string response;
 
     // Apply chat template to get prompt
     std::vector<char> buf(8192);
-    int len = llama_chat_apply_template(
-        llm->vocab,
+    int32_t len = llama_chat_apply_template(
+        llm->model,
         nullptr,  // use default template
         llm->chat_history.data(),
         llm->chat_history.size(),
@@ -109,48 +111,54 @@ static char* generate_response(LlmContext* llm, int max_tokens, float temperatur
         return strdup("[Error: chat template failed]");
     }
 
-    if (len > (int)buf.size()) {
+    if (len > (int32_t)buf.size()) {
         buf.resize(len + 1);
         llama_chat_apply_template(
-            llm->vocab, nullptr,
+            llm->model, nullptr,
             llm->chat_history.data(), llm->chat_history.size(),
             true, buf.data(), buf.size()
         );
     }
 
     // Tokenize
-    std::vector<llama_token> tokens;
-    tokens.resize(strlen(buf.data()) + 16);
-    int n_tokens = llama_tokenize(
-        llm->vocab, buf.data(), strlen(buf.data()),
-        tokens.data(), tokens.size(), true, false
+    int32_t n_tokens = llama_tokenize(
+        llm->model, buf.data(), strlen(buf.data()),
+        nullptr, 0, true, false
     );
-
     if (n_tokens < 0) {
         return strdup("[Error: tokenization failed]");
     }
-    tokens.resize(n_tokens);
+
+    std::vector<llama_token> tokens(n_tokens);
+    llama_tokenize(
+        llm->model, buf.data(), strlen(buf.data()),
+        tokens.data(), tokens.size(), true, false
+    );
 
     // Decode prompt
     llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
     for (size_t i = 0; i < tokens.size(); i++) {
-        llama_batch_add(batch, tokens[i], i, {0}, false);
+        add_to_batch(batch, tokens[i], (llama_pos)i, i == tokens.size() - 1);
     }
-    batch.logits[batch.n_tokens - 1] = 1;
     llama_decode(llm->ctx, batch);
     llama_batch_free(batch);
 
-    // Generate
-    int n_pos = tokens.size();
-    for (int i = 0; i < max_tokens && n_pos < 8192; i++) {
-        llama_token new_token = sample_token(llm->ctx, llm->vocab, temperature);
+    // Create sampler
+    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(12345));
 
-        if (llama_vocab_is_eog(llm->vocab, new_token)) {
+    // Generate
+    int32_t n_pos = tokens.size();
+    for (int32_t i = 0; i < max_tokens && n_pos < 8192; i++) {
+        llama_token new_token = sample_token(llm->ctx, smpl);
+
+        if (llama_token_is_eog(llm->model, new_token)) {
             break;
         }
 
         char piece[256];
-        int n = llama_token_to_piece(llm->vocab, new_token, piece, sizeof(piece), 0, true);
+        int32_t n = llama_token_to_piece(llm->model, new_token, piece, sizeof(piece), 0, true);
         if (n > 0) {
             response.append(piece, n);
             if (callback) {
@@ -164,14 +172,19 @@ static char* generate_response(LlmContext* llm, int max_tokens, float temperatur
         n_pos++;
     }
 
+    llama_sampler_free(smpl);
+
+    // Add assistant response to history
+    llm->chat_history.push_back({"assistant", strdup(response.c_str())});
+
     return strdup(response.c_str());
 }
 
-char* llm_chat_respond(LlmContext* llm, int max_tokens, float temperature) {
+char* llm_chat_respond(LlmContext* llm, int32_t max_tokens, float temperature) {
     return generate_response(llm, max_tokens, temperature, nullptr, nullptr);
 }
 
-void llm_chat_respond_stream(LlmContext* llm, int max_tokens, float temperature,
+void llm_chat_respond_stream(LlmContext* llm, int32_t max_tokens, float temperature,
                               TokenCallback callback, void* user_data) {
     char* result = generate_response(llm, max_tokens, temperature, callback, user_data);
     llm_free_string(result);
@@ -182,13 +195,13 @@ void llm_free_string(char* str) {
 }
 
 // Legacy API
-char* llm_generate(LlmContext* llm, const char* prompt, int max_tokens, float temperature) {
+char* llm_generate(LlmContext* llm, const char* prompt, int32_t max_tokens, float temperature) {
     llm_chat_clear(llm);
     llm_chat_add_user(llm, prompt);
     return llm_chat_respond(llm, max_tokens, temperature);
 }
 
-void llm_generate_stream(LlmContext* llm, const char* prompt, int max_tokens, float temperature,
+void llm_generate_stream(LlmContext* llm, const char* prompt, int32_t max_tokens, float temperature,
                          TokenCallback callback, void* user_data) {
     llm_chat_clear(llm);
     llm_chat_add_user(llm, prompt);

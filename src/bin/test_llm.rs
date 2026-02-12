@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
     // Find model
-    let model_path = PathBuf::from("/Users/yao/Desktop/code/work/mofa-org/mofa-input/models/qwen3-0.6b-q4_k_m.gguf");
+    let model_path = PathBuf::from("/Users/yao/Desktop/code/work/mofa-org/mofa-input/models/qwen2.5-0.5b-q4_k_m.gguf");
 
     if !model_path.exists() {
         println!("Model not found: {:?}", model_path);

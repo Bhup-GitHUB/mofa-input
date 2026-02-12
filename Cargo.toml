@@ -25,8 +25,8 @@ eframe = { version = "0.24", features = ["default"] }
 cpal = "0.15"
 hound = "3.5"
 
-# ML/ONNX (for FunASR)
-ort = { version = "1.16", features = ["load-dynamic"] }
+# ML/ONNX (for FunASR) - TODO: use valid version
+# ort = { version = "2.0", features = ["load-dynamic"] }
 ndarray = "0.15"
 
 # Utilities
